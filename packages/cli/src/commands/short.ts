@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { Buffer } from "node:buffer";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
@@ -48,6 +49,12 @@ shortCommand
   .option("--draft-review-model <model>", "Model for draft review")
   .option("--revise-model <model>", "Model for second full draft")
   .option("--package-model <model>", "Model for synopsis and cover prompt packaging")
+  .option("--cover-base-url <url>", "OpenAI-compatible Responses base URL for cover generation")
+  .option("--cover-endpoint <url>", "Exact Responses endpoint for cover generation; overrides --cover-base-url")
+  .option("--cover-model <model>", "Image-capable Responses model for cover generation", "gpt-5.5")
+  .option("--cover-size <size>", "Cover image size", "1024x1360")
+  .option("--cover-api-key-env <name>", "Env var containing cover API key", "INKOS_COVER_API_KEY")
+  .option("--no-cover", "Skip cover image generation")
   .option("--json", "Output JSON")
   .action(async (opts: ShortRunOptions) => {
     try {
@@ -212,6 +219,18 @@ shortCommand
         draft: draftV2,
       });
       await writePackageArtifacts(root, baseDir, salesPackage);
+      const coverArtifacts: { readonly coverImagePath?: string; readonly coverError?: string } = opts.cover === false
+        ? { coverError: "disabled by --no-cover" }
+        : await generateCoverArtifact({
+            root,
+            baseDir,
+            salesPackage,
+            coverBaseUrl: opts.coverBaseUrl,
+            coverEndpoint: opts.coverEndpoint,
+            coverModel: opts.coverModel,
+            coverSize: opts.coverSize,
+            coverApiKeyEnv: opts.coverApiKeyEnv,
+          }).catch((error: unknown) => ({ coverError: String(error) }));
 
       const payload = {
         storyId,
@@ -222,6 +241,8 @@ shortCommand
         finalJsonPath: join(baseDir, "final", "short-story.json"),
         salesPackagePath: join(baseDir, "final", "sales-package.md"),
         coverPromptPath: join(baseDir, "final", "cover-prompt.md"),
+        coverImagePath: coverArtifacts.coverImagePath,
+        coverError: coverArtifacts.coverError,
         models,
       };
 
@@ -231,6 +252,7 @@ shortCommand
         log(`Short run complete: ${storyId}`);
         log(`Final: ${payload.finalMarkdownPath}`);
         log(`Sales package: ${payload.salesPackagePath}`);
+        log(formatCoverStatus(payload.coverImagePath, payload.coverError));
         log("Benchmark: not used");
       }
     } catch (e) {
@@ -253,6 +275,12 @@ interface ShortRunOptions {
   readonly draftReviewModel?: string;
   readonly reviseModel?: string;
   readonly packageModel?: string;
+  readonly coverBaseUrl?: string;
+  readonly coverEndpoint?: string;
+  readonly coverModel?: string;
+  readonly coverSize?: string;
+  readonly coverApiKeyEnv?: string;
+  readonly cover?: boolean;
   readonly json?: boolean;
 }
 
@@ -396,6 +424,106 @@ async function writePackageArtifacts(root: string, baseDir: string, salesPackage
   await writeText(root, join(finalDir, "cover-prompt.md"), salesPackage.coverPrompt || "(empty)");
 }
 
+async function generateCoverArtifact(input: {
+  readonly root: string;
+  readonly baseDir: string;
+  readonly salesPackage: ShortHitSalesPackage;
+  readonly coverBaseUrl?: string;
+  readonly coverEndpoint?: string;
+  readonly coverModel?: string;
+  readonly coverSize?: string;
+  readonly coverApiKeyEnv?: string;
+}): Promise<{ readonly coverImagePath: string }> {
+  const endpoint = resolveCoverEndpoint(input.coverEndpoint, input.coverBaseUrl);
+  const model = input.coverModel || process.env.INKOS_COVER_MODEL || "gpt-5.5";
+  const size = input.coverSize || process.env.INKOS_COVER_SIZE || "1024x1360";
+  const apiKeyEnv = input.coverApiKeyEnv || "INKOS_COVER_API_KEY";
+  const apiKey = process.env[apiKeyEnv] || (isLocalhostUrl(endpoint) ? "sk-dummy" : "");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      input: buildCoverImagePrompt(input.salesPackage),
+      tools: [{ type: "image_generation", size }],
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`cover generation failed: HTTP ${response.status} ${text.slice(0, 500)}`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`cover generation returned non-JSON response: ${String(e)}`);
+  }
+
+  const imageBase64 = extractResponsesImageBase64(payload);
+  if (!imageBase64) {
+    throw new Error("cover generation response did not include image_generation_call result.");
+  }
+
+  const coverPath = join(input.baseDir, "final", "cover.png");
+  await writeBinary(input.root, coverPath, Buffer.from(imageBase64, "base64"));
+  return { coverImagePath: coverPath };
+}
+
+export function extractResponsesImageBase64(payload: unknown): string | undefined {
+  const output = (payload as { output?: unknown }).output;
+  if (!Array.isArray(output)) return undefined;
+
+  for (const item of output) {
+    const record = item as { type?: unknown; result?: unknown; content?: unknown };
+    if (record.type === "image_generation_call" && typeof record.result === "string" && record.result.trim()) {
+      return record.result.trim();
+    }
+    if (Array.isArray(record.content)) {
+      for (const contentItem of record.content) {
+        const contentRecord = contentItem as { type?: unknown; result?: unknown; image_base64?: unknown };
+        if (typeof contentRecord.result === "string" && contentRecord.result.trim()) return contentRecord.result.trim();
+        if (typeof contentRecord.image_base64 === "string" && contentRecord.image_base64.trim()) return contentRecord.image_base64.trim();
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function resolveCoverEndpoint(coverEndpoint?: string, coverBaseUrl?: string): string {
+  const endpoint = coverEndpoint || process.env.INKOS_COVER_ENDPOINT;
+  if (endpoint) return endpoint;
+  const baseUrl = coverBaseUrl || process.env.INKOS_COVER_BASE_URL;
+  if (!baseUrl) {
+    throw new Error("cover endpoint is required. Set INKOS_COVER_BASE_URL or pass --cover-base-url, or use --no-cover.");
+  }
+  return `${baseUrl.replace(/\/+$/u, "")}/responses`;
+}
+
+function buildCoverImagePrompt(salesPackage: ShortHitSalesPackage): string {
+  return [
+    "为中文商业短篇小说生成手机端平台书封，3:4竖图。",
+    `主标题：${salesPackage.title}`,
+    salesPackage.intro ? `简介：${salesPackage.intro}` : "",
+    salesPackage.sellingPoints.length > 0 ? `卖点：${salesPackage.sellingPoints.join("；")}` : "",
+    salesPackage.coverPrompt ? `包装提示：${salesPackage.coverPrompt}` : "",
+    "",
+    "封面方向：平台短篇书封，不是电影海报。标题字要成为主视觉，预留两到四行大字排版区；人物近景或半身，表情有冷笑、震惊、崩溃、压迫或反杀感；道具少而大，一眼能看出冲突。",
+    "颜色高对比、高饱和，适合手机列表缩略图。避免写实会议摄影、横版视频缩略图、杂志大片、小清新细字和长段文字。",
+    "如果模型文字不稳定，优先生成明确标题留白/字块/排版空间，不要把大量乱码文字铺满画面。",
+  ].filter(Boolean).join("\n");
+}
+
+async function writeBinary(root: string, path: string, value: Buffer): Promise<void> {
+  const resolved = resolvePath(root, path);
+  await mkdir(dirname(resolved), { recursive: true });
+  await writeFile(resolved, value);
+}
+
 async function writeJson(root: string, path: string, value: unknown): Promise<void> {
   await writeText(root, path, JSON.stringify(value, null, 2));
 }
@@ -408,6 +536,15 @@ async function writeText(root: string, path: string, value: string): Promise<voi
 
 function resolvePath(root: string, path: string): string {
   return isAbsolute(path) ? path : resolve(root, path);
+}
+
+function isLocalhostUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "::1";
+  } catch {
+    return false;
+  }
 }
 
 function parseBoundedInteger(
@@ -453,6 +590,12 @@ function safeFileName(value: string): string {
     .trim()
     .slice(0, 80);
   return cleaned || "short-hit";
+}
+
+function formatCoverStatus(coverImagePath?: string, coverError?: string): string {
+  if (coverImagePath) return `Cover: ${coverImagePath}`;
+  if (coverError) return `Cover: skipped (${coverError})`;
+  return "Cover: skipped";
 }
 
 function logCommandError(prefix: string, error: unknown, json?: boolean): void {
